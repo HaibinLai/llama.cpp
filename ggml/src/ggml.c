@@ -5849,6 +5849,7 @@ static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_ten
 }
 
 void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    // printf("ggml_build_forward_expand: %s\n", tensor->name);
     ggml_build_forward_impl(cgraph, tensor, true);
 }
 

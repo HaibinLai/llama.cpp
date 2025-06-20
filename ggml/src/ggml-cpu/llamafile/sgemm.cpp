@@ -413,8 +413,14 @@ class tinyBLAS {
             std::atomic_store_explicit(&current_chunk, (int64_t)params->nth, std::memory_order_relaxed);
         }
 
-        ggml_barrier(params->threadpool);
+        // printf("thread %d: m=%lld, n=%lld, k=%lld, RM=%d, RN=%d, BM=%d, NB_BN=%lld, SIZE_BN=%lld, jj_RN=%lld, jj_BN=%lld\n",
+        //        params->ith, (long long)m, (long long)n, (long long)k,
+        //        RM, RN, BM, (long long)NB_BN, (long long)SIZE_BN, (long long)jj_RN, (long long)jj_BN);
+        // ggml_barrier(params->threadpool);
+        #pragma task wait
 
+        // #pragma omp task
+        {
         int64_t job = params->ith;
         while (job < nb_job) {
             const int64_t ii = (job % ytiles) * RM * BM;
@@ -442,7 +448,10 @@ class tinyBLAS {
             // next step.
             job = std::atomic_fetch_add_explicit(&current_chunk, (int64_t)1, std::memory_order_relaxed);
         }
-
+    }
+        // printf("thread %d finished %lld jobs\n", params->ith, (long long)job);
+        
+        // #pragma task wait
         ggml_barrier(params->threadpool);
         return;
     }
