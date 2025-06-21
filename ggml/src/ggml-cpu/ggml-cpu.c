@@ -3186,6 +3186,157 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+
+
+// 你的函数封装，传入线程池指针和线程数
+inline double run_ggml_task_parallel_compute(struct ggml_threadpool *threadpool, int n_threads, int start_node, int end_node) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    struct ggml_compute_state *state1 = &threadpool->workers[0];
+    struct ggml_threadpool *tp1 = state1->threadpool;
+    const struct ggml_cgraph *cgraph_bin = tp1->cgraph;
+    const struct ggml_cplan *cplan_bin = tp1->cplan;
+
+    #pragma omp parallel num_threads(n_threads)
+    {
+        #pragma omp single
+        {
+            // 实际线程数更新
+            n_threads = omp_get_num_threads();
+            atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
+            printf("OpenMP threads: %d\n", n_threads);
+        }
+
+        #pragma omp single
+        {
+            for (int node_n = start_node; node_n < end_node; node_n++) {
+                struct ggml_tensor *node = cgraph_bin->nodes[node_n];
+
+                for (int ith = 0; ith < n_threads; ++ith) {
+                    #pragma omp task firstprivate(ith, node_n, node)
+                    {
+                        struct ggml_compute_state *state2 = &threadpool->workers[ith];
+                        set_numa_thread_affinity(state2->ith);
+                        struct ggml_threadpool *tp2 = state2->threadpool;
+                        const struct ggml_cplan *cplan_bin2 = tp2->cplan;
+
+                        struct ggml_compute_params local_params = {
+                            .ith = ith,
+                            .nth = atomic_load_explicit(&tp2->n_threads_cur, memory_order_relaxed),
+                            .wsize = cplan_bin2->work_size,
+                            .wdata = cplan_bin2->work_data,
+                            .threadpool = state2->threadpool,
+                        };
+
+                        ggml_compute_forward(&local_params, node);
+                        printf("OpenMP: thread #%d finished processing node %d/%d\n", ith, node_n + 1, cgraph_bin->n_nodes);
+
+                        if (cplan_bin2->abort_callback &&
+                            cplan_bin2->abort_callback(cplan_bin2->abort_callback_data)) {
+                            atomic_store_explicit(&threadpool->abort, node_n + 1, memory_order_relaxed);
+                            threadpool->ec = GGML_STATUS_ABORTED;
+                        }
+                    }
+                }
+
+                #pragma omp taskwait
+
+                printf("OpenMP: finished processing node %d/%d\n\n", node_n + 1, cgraph_bin->n_nodes);
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double time_diff_ns = get_time_diff_ns(start, end);
+    printf("Time elapsed: %.2f ns (%.6f ms)\n", time_diff_ns, time_diff_ns / 1e6);
+    return time_diff_ns;
+}
+
+inline double run_ggml_forkjoin_parallel_compute(struct ggml_threadpool *threadpool, int n_threads, int start_node, int end_node) {
+    double thread_times[n_threads];  // 全局数组或传入指针
+
+    // 时间差函数
+    double get_time_diff_us(struct timespec start, struct timespec end) {
+        return (end.tv_sec - start.tv_sec) * 1e6 + 
+            (end.tv_nsec - start.tv_nsec) / 1e3;
+    }
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    #pragma omp parallel num_threads(n_threads)
+    {
+        #pragma omp single
+        {
+            n_threads = omp_get_num_threads(); // 更新实际线程数
+            atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
+            
+        }
+
+        // 执行计算任务
+        // ggml_graph_compute_thread(&threadpool->workers[tid]);
+
+        int tid = omp_get_thread_num();
+
+        struct ggml_compute_state * state = (struct ggml_compute_state *) &threadpool->workers[tid];
+        struct ggml_threadpool    * tp    = state->threadpool;
+
+        const struct ggml_cgraph * cgraph = tp->cgraph;
+        const struct ggml_cplan  * cplan  = tp->cplan;
+        set_numa_thread_affinity(state->ith);
+
+        struct ggml_compute_params params = {
+            /*.ith       =*/ state->ith,
+            /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
+            /*.wsize     =*/ cplan->work_size,
+            /*.wdata     =*/ cplan->work_data,
+            /*.threadpool=*/ tp,
+        };
+
+        for (int node_n = start_node; node_n < end_node && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+            // uint64_t start_cycles = rdtscp_start();
+
+            struct ggml_tensor * node = cgraph->nodes[node_n];
+            ggml_compute_forward(&params, node);
+
+            if (state->ith == 0 && cplan->abort_callback &&
+                    cplan->abort_callback(cplan->abort_callback_data)) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                tp->ec = GGML_STATUS_ABORTED;
+            }
+
+            // uint64_t end_cycles = rdtscp_end();
+            // uint64_t elapsed_cycles = end_cycles - start_cycles;
+
+            // 如果你知道主频，比如3.4GHz
+            // double elapsed_us = (double) elapsed_cycles / 3400.0;
+
+            // printf("thread #%d processed node %d/%d in %.2f us (%lu cycles)\n",
+            //    state->ith, node_n + 1, cgraph->n_nodes, elapsed_us, elapsed_cycles);
+
+            // uint64_t start_cycles_barrier = rdtscp_start();
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
+            // uint64_t end_cycles_barrier = rdtscp_end();
+            // uint64_t elapsed_cycles_barrier = end_cycles_barrier - start_cycles_barrier;
+            // double elapsed_us_barrier = (double) elapsed_cycles_barrier / 3400.0;
+
+            // // 输出处理时间
+            // printf("thread #%d processed node %d/%d in %.3f us (barrier: %.3f us)\n",
+            //     state->ith, node_n + 1, cgraph->n_nodes, elapsed_us, elapsed_us_barrier);
+            if(state->ith == 0){
+                printf("fork-join processed node %d/%d\n",  node_n + 1, cgraph->n_nodes);
+            }
+        }
+
+        ggml_barrier(state->threadpool);
+
+    }
+}
+
+
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3219,61 +3370,62 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // vector<double> thread_time(n_threads, 0.0);
     typedef struct {
-    int n_threads_cur;
-    void* workers; // 假设 workers 是一个数组，类型待定
-} threadpool_t;
+        int n_threads_cur;
+        void* workers; // 假设 workers 是一个数组，类型待定
+    } threadpool_t;
 
-double* thread_times = (double*)calloc(n_threads, sizeof(double));
+    double* thread_times = (double*)calloc(n_threads, sizeof(double));
 
 // #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
 
-double thread_times[n_threads];  // 全局数组或传入指针
+    double thread_times[n_threads];  // 全局数组或传入指针
 
-// 时间差函数
-double get_time_diff_us(struct timespec start, struct timespec end) {
-    return (end.tv_sec - start.tv_sec) * 1e6 + 
-           (end.tv_nsec - start.tv_nsec) / 1e3;
-}
+    // 时间差函数
+    double get_time_diff_us(struct timespec start, struct timespec end) {
+        return (end.tv_sec - start.tv_sec) * 1e6 + 
+            (end.tv_nsec - start.tv_nsec) / 1e3;
+    }
 
-
+    // run_ggml_task_parallel_compute(threadpool, n_threads, 0, 27);
+    run_ggml_forkjoin_parallel_compute(threadpool, n_threads, 28, cgraph->n_nodes);
         
- struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    // struct timespec start, end;
+    // clock_gettime(CLOCK_MONOTONIC, &start);
 
-    #pragma omp parallel num_threads(n_threads)
-    {
-        #pragma omp single
-        {
-            n_threads = omp_get_num_threads(); // 更新实际线程数
-            atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
-        }
+    // #pragma omp parallel num_threads(n_threads)
+    // {
+    //     #pragma omp single
+    //     {
+    //         n_threads = omp_get_num_threads(); // 更新实际线程数
+    //         atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
+    //     }
 
-        int tid = omp_get_thread_num();
-        struct timespec start_time, end_time;
+    //     int tid = omp_get_thread_num();
+    //     struct timespec start_time, end_time;
 
-        // 记录线程开始时间
-        clock_gettime(CLOCK_MONOTONIC, &start_time);
+    //     // 记录线程开始时间
+    //     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        // 执行计算任务
-        ggml_graph_compute_thread(&threadpool->workers[tid]);
+    //     // 执行计算任务
+    //     ggml_graph_compute_thread(&threadpool->workers[tid]);
 
-        // 记录线程结束时间
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
+    //     // 记录线程结束时间
+    //     clock_gettime(CLOCK_MONOTONIC, &end_time);
 
-        // 计算耗时（微秒）
-        thread_times[tid] = get_time_diff_us(start_time, end_time);
-    }
+    //     // 计算耗时（微秒）
+    //     thread_times[tid] = get_time_diff_us(start_time, end_time);
+    // }
 
-    // 打印每个线程用时
-    for (int i = 0; i < n_threads; i++) {
-        printf("Thread %d time: %.6f us\n", i, thread_times[i]);
-    }
+    // // 打印每个线程用时
+    // for (int i = 0; i < n_threads; i++) {
+    //     printf("Thread %d time: %.6f us\n", i, thread_times[i]);
+    // }
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double total_time_ns = (end.tv_sec - start.tv_sec) * 1e9 +
-                           (end.tv_nsec - start.tv_nsec);
-    printf("Total time elapsed: %.2f ns (%.6f ms)\n", total_time_ns, total_time_ns / 1e6);
+    // clock_gettime(CLOCK_MONOTONIC, &end);
+    // double total_time_ns = (end.tv_sec - start.tv_sec) * 1e9 +
+    //                        (end.tv_nsec - start.tv_nsec);
+    // printf("Total time elapsed: %.2f ns (%.6f ms)\n", total_time_ns, total_time_ns / 1e6);
         
 
 // /////////////////////// BEGIN ////////////////////

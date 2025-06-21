@@ -70,6 +70,10 @@ extern "C" {
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads);
 
+    GGML_BACKEND_API double run_ggml_task_parallel_compute(struct ggml_threadpool *threadpool, int n_threads, int start_node, int end_node);
+
+
+    GGML_BACKEND_API double run_ggml_forkjoin_parallel_compute(struct ggml_threadpool *threadpool, int n_threads, int start_node, int end_node);
     //
     // system info
     //
